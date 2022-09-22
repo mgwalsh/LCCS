@@ -1,0 +1,330 @@
+---
+title:  Land cover classification with multilabel GeoSurvey data from Malawi
+author: M.G. Walsh, A.M. Sila and B.A. Walsh
+date: "`r format(Sys.time(), '%d, %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    fig_caption: true
+    keep_md: true
+    number_sections: true
+    css: style1.css
+---
+
+```{r setup, echo = FALSE}
+
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# Introduction
+
+Quantifying the geographical extent, location and spatial dynamics of croplands, rural and urban settlements and different types of vegetation cover provides essential information for monitoring and managing human dominated ecosystems and landscapes. Large portions of Africa remain a virtual "*terra incognita*" in this context. The main reason for monitoring [land cover](https://en.wikipedia.org/wiki/Land_cover) is to assess where in a particular country or region of interest ([ROI](https://en.wikipedia.org/wiki/Region_of_interest)) significant impacts of humans on ecosystem services can be expected within different land cover classes, and *vice versa*.
+
+The main goal of this notebook is to illustrate improved starter code for predictive land cover mapping with multilabel data (also see the previous workflow examples [here](https://osf.io/vxc97/)). We use Malawi's legacy GeoSurvey data from 2018 and the associated raster features to illustrate the general approach and the main data analysis steps. Land cover data present a special class of [labeling](https://en.wikipedia.org/wiki/Labeled_data) problems for data mining, machine learning and various statistical applications because they frequently contain multiple labels, which may be interdependent. The figure below illustrates the structure of multilabel data relative to binary and multiclass data types and classification tasks.
+
+<br>
+```{r, echo=FALSE, fig.align="center", fig.cap="**Figure 1:** Main differences between binary, multiclass and multilabel data types.", out.width = '70%'}
+
+knitr::include_graphics("classification.png")
+```
+
+[GeoSurvey](https://geosurvey.qed.ai/) is an application for rapidly collecting and analyzing land cover observations. High resolution satellite images and/or other aerial (e.g., aircraft or drone) imagery can be systematically and rapidly labeled by either trained image interpreters and/or by vetted *crowds* of [Citizen Scientists](https://en.wikipedia.org/wiki/Citizen_science). When done with care, these observations can result in large, well-structured, properly labeled, geospatial data sets that are suitable for data mining, machine learning and geostatistical predictions of land cover and in some instances for monitoring [land use](https://nca2018.globalchange.gov/chapter/5/). When supplied with properly time-stamped imagery, GeoSurvey can also be used for monitoring ecosystem and landscape changes. Figure 2 shows some labeled examples from Malawi.
+
+```{r, echo=FALSE, fig.align="center", fig.cap="**Figure 2:** Examples of tagged multilabel GeoSurvey observations over Malawi (2018).", out.width = '95%'}
+
+knitr::include_graphics("MW_geos_examples.jpg")
+```
+
+The detailed manual for conducting your own GeoSurveys is available at: [GeoSurvey manual](https://docs.google.com/document/d/1y-HYUSYpDVESPdmEcl3I2kuL0bwrT41wMiq0zE9uzOs/edit). The manual should definitely be consulted to obtain more information about how GeoSurvey can be used to carry out potentially high value surveys of remote areas. There is also a great slide deck available [here](https://docs.google.com/presentation/d/1vBQ-By8LLvyJQzMBFaqUuRwFFeL7Y8QXUtBifx-3jn4/edit#slide=id.g14d47405c8_0_0), which illustrates different land cover and use labeling approaches. I'll not cover those issues in this notebook and will assume that you already have well-designed GeoSurvey data and well collocated spatial features in hand.
+
+# Data setup
+
+To run this notebook, you will need to load the packages indicated in the chunk below. This allows you to model and predict the Malawi GeoSurvey observations using machine learning algorithms [MLAs](https://en.wikipedia.org/wiki/Outline_of_machine_learning) and/or [geostatistics](https://en.wikipedia.org/wiki/Geostatistics). The notebook itself is versioned and maintained on [Github](), and you can fork and modify it from there as you see fit.
+
+```{r}
+# Package names
+packages <- c("tidyverse", "rgdal", "sp", "raster", "leaflet", "htmlwidgets", "caret", "caretEnsemble",
+              "doParallel", "pROC")
+
+# Install packages
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+    install.packages(packages[!installed_packages])
+}
+
+# Load packages
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+## Data downloads
+
+This chunk loads the data, which are needed to run this example. The downloads contain the most recent GeoSurvey data from 2018, and the respective raster features. The survey data should be downloaded **to your working directory** from https://osf.io/myzct. The raster maps can be downloaded from https://osf.io/dcsgm. The next chunk then loads the data from your working directory and links the GeoSurvey with the rasters.
+
+```{r, results = 'hide'}
+# GeoSurvey data
+geos <- read.table("MW_gsdat18.csv", header = T, sep = ",")
+geos$BP <- as.factor(ifelse(geos$BP == 1, "a", "b"))
+geos$CP <- as.factor(ifelse(geos$CP == 1, "a", "b"))
+geos$WP <- as.factor(ifelse(geos$WP == 1, "a", "b"))
+
+# Raster feature data
+# unzip("MW_250m_2018.zip", overwrite = T)
+glist <- list.files(pattern="tif", full.names=T)
+grids <- stack(glist)
+
+# Project GeoSurvey coords to grid CRS
+geos.proj <- as.data.frame(project(cbind(geos$lon, geos$lat), 
+                                   "+proj=laea +ellps=WGS84 +lon_0=20 +lat_0=5 +units=m +no_defs"))
+
+colnames(geos.proj) <- c("x","y")
+geos <- cbind(geos, geos.proj)
+coordinates(geos) <- ~x+y
+projection(geos) <- projection(grids)
+
+# Extract raster variables at GeoSurvey locations
+geosgrid <- extract(grids, geos)
+gsdat <- as.data.frame(cbind(geos, geosgrid)) 
+gsdat <- na.omit(gsdat) ## includes only complete cases
+# gsdat <- gsdat[!duplicated(gsdat), ] ## removes any duplicates 
+```
+
+An overview map of where the >18k, spatially representative, Malawi GeoSurvey observations were collected by trained image interpreters in 2018 is generated by the next chunk. You can click and zoom into the individual locations.
+
+```{r}
+# Plot GeoSurvey sample locations
+w <- leaflet() %>%
+  setView(lng = mean(gsdat$lon), lat = mean(gsdat$lat), zoom = 7) %>%
+  addProviderTiles(providers$OpenStreetMap.Mapnik) %>%
+  addCircleMarkers(gsdat$lon, gsdat$lat, clusterOptions = markerClusterOptions())
+saveWidget(w, 'MW_GS_sample_locs.html', selfcontained = T) ## save widget
+w ## plot widget
+```
+
+## Calibration / validation split
+
+To start the fitting processes the next chunk scrubs some of the extraneous objects in memory, removes any incomplete cases, sets-up labels and features, and creates a randomized (80/20%) partition between the training and validation dataframes.
+
+```{r}
+# Set output directories
+dir.create("results", showWarnings=F)
+dir.create("base_learner", showWarnings=F)
+
+# Set calibration/validation set randomization seed
+seed <- 12358
+set.seed(seed)
+
+# Split data into calibration and validation sets
+gsIndex <- createDataPartition(gsdat$BP, p = 4/5, list = F, times = 1)
+gs_cal <- gsdat[ gsIndex,]
+gs_val <- gsdat[-gsIndex,]
+
+# GeoSurvey calibration labels
+labs <- c("BP") ## insert other presence/absence labels (CP, WP) here!
+lcal <- as.vector(t(gs_cal[labs]))
+
+# Raster calibration features
+fcal <- gs_cal[ ,c(9:42)]
+```
+
+The chunk also sets the calibration labels and the associated raster features. Note that while we are illustrating the code for are buildings present? (`BP`) data here, you would also need to substitute the cropland and woody cover >60% presence variables (`CP` and `WP`) and specify those with the `labs` variable in the chunk directly above. If we were to run all 3 land cover labels at once, a "*normal*" computer would quickly run out of memory in training the complete predictions for this dataset.
+
+# Spatial multilabel predictions
+
+We will be using a **stacked generalization** here ([Wolpert, 1992](http://machine-learning.martinsewell.com/ensembles/stacking/Wolpert1992.pdf)). This amounts to independently training individual binary classifiers for each individual land cover label and then combining (stacking) the classifiers to account for dependencies between labels. Given unseen samples, the stacked model then predicts all of the labels for which the respective base classifiers indicate positive results. This method of dividing the task into multiple binary tasks resembles the more familiar *one-vs-rest* or *one-vs-one* methods that are typically used in [multiclass classification](https://en.wikipedia.org/wiki/Multiclass_classification) tasks. However, it is fundamentally different because binary or multiclass classifiers only deal with single rather than multiple target labels; see e.g., [Probst et. al., (2017)](https://journal.r-project.org/archive/2017/RJ-2017-012/RJ-2017-012.pdf) for a concise description about how stacking works in the context of multilabel classification.
+
+## Base-learner training
+
+This chunk fits 5 models that use the that use all of gridded calibration data with 10-fold cross-validation. Learn more about how these algorithms work by following links at: 
+[MASS](https://cran.r-project.org/web/packages/MASS/index.html),
+[randomForest](https://www.rdocumentation.org/packages/randomForest/versions/4.6-14/topics/randomForest), [xgboost](https://www.kaggle.com/rtatman/machine-learning-with-xgboost-in-r/)
+and [nnet](https://cran.r-project.org/web/packages/nnet/nnet.pdf). You can use `caretEnsemble` instead of `caret` as long as the feature variables (`grids` in this case), and the `trainControl` methods are the same for each model in the `caretList` function. This shortens the script-length of this notebook but does not otherwise affect the overall `caret` functionality. Note however that the calculations take a bit of time to run on a normal 8-core, 16 Gb memory computer. This is not a big problem for a relatively small ROI like Malawi, but it might be computationally challenging for larger countries like the DRC, Tanzania or Ethiopia. We fit these models with 10-fold cross-validation and default-tuning of the relevant [hyperparameters](https://en.wikipedia.org/wiki/Hyperparameter_(machine_learning)).
+
+```{r, warning = FALSE, results='hide'}
+# Start doParallel
+set.seed(seed)
+mc <- makeCluster(detectCores())
+registerDoParallel(mc)
+
+# Specify model training controls
+tc <- trainControl(method = "cv", number = 10, classProbs = T,
+                   summaryFunction = twoClassSummary, allowParallel = TRUE, savePredictions="final")
+
+# Fit 4 base classifiers using all of the raster features
+blist <- caretList(fcal, lcal,
+                   trControl = tc,
+                   tuneList = NULL,
+                   methodList = c("glmStepAIC", "rf", "xgbTree", "nnet"),
+                   preProcess = c("center","scale"),
+                   metric = "ROC")
+
+# Generate spatial predictions
+gl.pred <- predict(grids, blist$glmStepAIC, type = "prob")
+rf.pred <- predict(grids, blist$rf, type = "prob")
+xt.pred <- predict(grids, blist$xgbTree, type = "prob")
+nn.pred <- predict(grids, blist$nnet, type = "prob")
+spreds <- stack(gl.pred, rf.pred, xt.pred, nn.pred)
+names(spreds) <- c("gl","rf","xt","nn")
+
+# Save fitted models
+stopCluster(mc)
+fname <- paste("./base_learner/", labs, "_blist.rds", sep = "")
+saveRDS(blist, fname)
+```
+
+This next chunk then fits and predicts a classifier ensemble based on the initial 4 base-learner models using the calibration data. 
+
+```{r, results = 'hide'}
+# Extract base-learner predictions at GeoSurvey locations
+coordinates(gs_cal) <- ~x+y
+projection(gs_cal) <- projection(spreds)
+gspred <- extract(spreds, gs_cal)
+gs_cal <- as.data.frame(cbind(gs_cal, gspred))
+fcal <- gs_cal[ ,c(43:46)]
+
+# Start doParallel
+mc <- makeCluster(detectCores())
+registerDoParallel(mc)
+
+# Control setup
+set.seed(1385321)
+tc <- trainControl(method = "repeatedcv", number = 10, repeats = 3, classProbs = T, 
+                   summaryFunction = twoClassSummary, allowParallel = T)
+
+# Model training
+en <- train(fcal, lcal,
+            method = "glmStepAIC",
+            family = "binomial",
+            metric = "ROC",
+            trControl = tc)
+
+# Model outputs & predictions
+en.pred <- predict(spreds, en, type = "prob") ## ensemble spatial predictions
+stopCluster(mc)
+fname <- paste("./base_learner/", labs, "_en.rds", sep = "")
+saveRDS(en, fname)
+
+# Write out base-learner prediction grids
+spreds <- stack(gl.pred, rf.pred, xt.pred, nn.pred, en.pred)
+names(spreds) <- c("gl","rf","xt","nn","en")
+fname <- paste("./base_learner/", "base_", labs, "_preds.tif", sep = "")
+writeRaster(spreds, filename=fname, datatype="FLT4S", options="INTERLEAVE=BAND", overwrite=T)
+```
+
+To save time we have pre-trained all 15 base learners we'll be using for the stacking and model validation steps below. This is a bit of hack. However, you can download all of the associated `.rds` model and `.gtif` files from our GeoSurvey OSF repository [here](https://osf.io/f4p8g). If you'd like to train your own classifiers, make sure to scrub extraneous objects in memory after the initial training steps only retaining the `gs_cal`, `gs_val` and `lcal` dataframes for the next steps.
+
+## Multilabel-learner training
+
+The overall training process is quite similar to that for the base-learners. The main difference is that is that the training features that are used now are the ensemble learner predictions that were generated in Section 3.2 above. This is one form of a **problem transformation** approach to multilabel classification (see e.g., [Probst et. al., 2017](https://journal.r-project.org/archive/2017/RJ-2017-012/RJ-2017-012.pdf)), which handles the dependencies among labels. You can download the 3 pre-trained ensemble prediction grids that are needed for this step from https://osf.io/f4p8g. Make sure to unzip and place those into your `base_learner` sub-directory.
+
+```{r, results = 'hide'}
+# Scrub extraneous objects in memory
+rm(list=setdiff(ls(), c("gs_cal", "gs_val", "labs", "lcal"))) ## scrubs extraneous objects in memory
+
+# Load ensemble-learner raster files
+glist <- list.files(path="./base_learner", pattern="_en.tif", full.names = T)
+grids <- stack(glist) ## load ensemble-learner grids
+coordinates(gs_cal) <- ~x+y
+projection(gs_cal) <- projection(grids)
+
+# Extract gridded variables at survey locations
+mlcgrid <- extract(grids, gs_cal)
+gs_cal <- as.data.frame(cbind(gs_cal, mlcgrid))
+```
+
+The next chunk then fits the stacked multilabel models to the calibration data. 
+
+```{r, results = 'hide'}
+#Select calibration features
+fcal <- gs_cal[ , c(47:49)]
+
+# Start doParallel
+mc <- makeCluster(detectCores())
+registerDoParallel(mc)
+
+# Control setup
+set.seed(1385321)
+tc <- trainControl(method = "repeatedcv", number = 10, repeats = 3, classProbs = T, 
+                   summaryFunction = twoClassSummary, allowParallel = T)
+
+# Model training
+st <- train(fcal, lcal,
+            method = "glmStepAIC",
+            family = "binomial",
+            metric = "ROC",
+            trControl = tc)
+
+# Model outputs & predictions
+st.pred <- predict(grids, st, type = "prob") ## stacked spatial predictions
+stopCluster(mc)
+fname <- paste("./results/", labs, "_st.rds", sep = "")
+saveRDS(st, fname)
+
+# Write out multilabel-learner prediction grids
+fname <- paste("./results/", "stack_", labs, "_pred.tif", sep = "")
+writeRaster(st.pred, filename=fname, datatype="FLT4S", overwrite=T)
+```
+
+Figure 3 shows the multilabel-learner predictions (... after applying a few GIS cosmetics in [GRASS](https://grass.osgeo.org/)) that will be used in the model validation part of this notebook. Note that the presence of buildings (in red) is positively associated with croplands (yellow) in different configurations and both are negatively associated with the presence of dense (>60%) woody vegetation cover (green). You can download, examine and reuse the pre-trained model objects and spatial predictions at https://osf.io/eyda2. Unzip and place those into your `results` sub-directory.
+
+<br>
+```{r, echo=FALSE, fig.align="center", fig.cap="**Figure 3:** Multilabel-learner predictions indicating the presence / absence of buildings, croplands, and dense woody vegetation cover.", out.width = '80%'}
+
+knitr::include_graphics("MW_stacked_learners.jpg")
+```
+
+## Model validation
+
+The models that have been developed have not seen any of the validation (test-set) data up to this stage. The next chunks calculate the Receiver Operator Characteristics ([ROC](https://en.wikipedia.org/wiki/Receiver_operating_characteristic)) for the mapped predictions of the land cover multilabels using the validation data.
+
+```{r}
+# Scrub extraneous objects
+unlink("./results/*.xml")
+rm(list=setdiff(ls(), c("gs_val", "labs", "lcal"))) ## scrubs extraneous objects in memory
+
+# Load multilabel learner rasters
+glist <- list.files(path="./results", pattern="_pred.tif", full.names = T)
+grids <- stack(glist) ## load multilabel learner grids
+
+# Extract gridded variables at survey locations
+coordinates(gs_val) <- ~x+y
+projection(gs_val) <- projection(grids)
+mlcgrid <- extract(grids, gs_val)
+gs_val <- as.data.frame(cbind(gs_val, mlcgrid))
+```
+
+A [ROC curve](https://en.wikipedia.org/wiki/Receiver_operating_characteristic) provides information about a classification test's performance. The closer the apex of the curve toward the upper left corner, the greater the discriminatory ability  of the test (i.e., the true-positive (*Sensitivity*) and the true-negative (*Specificity*) rates are both high. This next chunk does the calculations and plots the ROC curve using the [`pROC`](https://www.rdocumentation.org/packages/pROC/versions/1.18.0) package. Areas under the ROC curve [AUC](https://en.wikipedia.org/wiki/Receiver_operating_characteristic) of 1 discriminate perfectly. AUC values of 0.5 are no better than a random guess.
+
+```{r, results = 'hide'}
+# Buildings
+BP_roc <- roc(gs_val$BP, gs_val$stack_BP_pred)
+BP_auc <- auc(BP_roc)
+
+# Croplands
+CP_roc <- roc(gs_val$CP, gs_val$stack_CP_pred)
+CP_auc <- auc(CP_roc)
+
+# Dense woody vegetation cover (>60%)
+WP_roc <- roc(gs_val$WP, gs_val$stack_WP_pred)
+WP_auc <- auc(WP_roc)
+```
+
+```{r, fig.align = "center", fig.cap = "**Figure 4:** Classification ROC curves for the validation set. Buldings (red), croplands (yellow), dense woody vegetation cover (>60%, green)."}
+
+par(pty="s", mar=c(4,4,1,1))
+plot(BP_roc, xlim=c(1,0), ylim=c(0,1), col="tomato", cex.axis = 1, cex.lab = 1.3)
+lines(CP_roc, col="#feb24c")
+lines(WP_roc, col="dark green")
+```
+
+# Main takeaways
+
+* This notebook generates precise and accurate spatial predictions of the observed occurrence (presence / absence) of buildings (AUC = 0.87), croplands (AUC = 0.98) and dense woody vegetation cover (AUC = 0.99) in Malawi based on a completely reproducible ensemble machine learning workflow. 
+
+* Note that the somewhat lower AUC for building prediction warrants further investigation, it may be due to overfitting of the base-learner models developed under section 3.1. We will update this in a future version of this notebook. 
+
+* The workflow can be flexibly extended to map other land cover variables e.g., the density of buildings, soil conservation infrastructure and crop type distributions, among others. It can also be rapidly extended to cover new geographies and ROIs with new observations, geodata and/or alternative MLAs.
+
+* The workflow outputs can be used to improve the precision and accuracy of small land cover area estimates; see an example from Rwanda [here](https://africasoils.info/wp-content/uploads/2022/07/RWA_cropland_area.html), and depending on the availability of properly time-stamped GeoSurveys and their associated remote sensing data, also for cropland area monitoring and change detection workflows, both operationally and at low cost compared to conventional land cover mapping practices.
+
+Any questions, comments or corrections related to this notebook are most welcome via [AFSIS](mailto:mgw.africasoils.info).
